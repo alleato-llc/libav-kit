@@ -215,18 +215,22 @@ Named, reusable encoding configuration with output format, settings, and optiona
 
 ## Demo CLI (`libav-play`)
 
-An internal CLI app that plays audio using LibAVKit. Not published as a library product — run it with `swift run`.
+An internal CLI app that plays audio using LibAVKit. Build first, then run the binary directly for live progress updates (`swift run` buffers stdout, which prevents the progress line from updating in-place):
+
+```bash
+swift build
+```
 
 ### File mode
 
 Plays a local file using `AudioPlayer` with metadata display and progress tracking:
 
 ```bash
-swift run libav-play song.flac
-swift run libav-play --volume 0.5 song.mp3
+.build/debug/libav-play song.flac
+.build/debug/libav-play --volume 0.5 song.mp3
 
 # Quick test with a bundled fixture
-swift run libav-play Tests/LibAVKitTests/Fixtures/Parametric/flac-44100-stereo.flac
+.build/debug/libav-play Tests/LibAVKitTests/Fixtures/Parametric/flac-44100-stereo.flac
 ```
 
 ### STDIN mode
@@ -234,8 +238,8 @@ swift run libav-play Tests/LibAVKitTests/Fixtures/Parametric/flac-44100-stereo.f
 Pipes audio through `Decoder` + `AVAudioEngineOutput` directly. Requires `--format` since FFmpeg can't detect the codec from a pipe:
 
 ```bash
-cat song.opus | swift run libav-play --format opus -
-ffmpeg -i input.wav -f flac - 2>/dev/null | swift run libav-play --format flac -
+cat song.opus | .build/debug/libav-play --format opus -
+ffmpeg -i input.wav -f flac - 2>/dev/null | .build/debug/libav-play --format flac -
 ```
 
 ### Options
