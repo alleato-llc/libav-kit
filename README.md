@@ -219,6 +219,7 @@ An internal CLI app that plays audio using LibAVKit. Build first, then run the b
 
 ```bash
 swift build
+LIBAV_PLAY=$(swift build --show-bin-path)/libav-play
 ```
 
 ### File mode
@@ -226,11 +227,11 @@ swift build
 Plays a local file using `AudioPlayer` with metadata display and progress tracking:
 
 ```bash
-.build/debug/libav-play song.flac
-.build/debug/libav-play --volume 0.5 song.mp3
+$LIBAV_PLAY song.flac
+$LIBAV_PLAY --volume 0.5 song.mp3
 
 # Quick test with a bundled fixture
-.build/debug/libav-play Tests/LibAVKitTests/Fixtures/Parametric/flac-44100-stereo.flac
+$LIBAV_PLAY Tests/LibAVKitTests/Fixtures/Parametric/flac-44100-stereo.flac
 ```
 
 ### STDIN mode
@@ -238,8 +239,8 @@ Plays a local file using `AudioPlayer` with metadata display and progress tracki
 Pipes audio through `Decoder` + `AVAudioEngineOutput` directly. Requires `--format` since FFmpeg can't detect the codec from a pipe:
 
 ```bash
-cat song.opus | .build/debug/libav-play --format opus -
-ffmpeg -i input.wav -f flac - 2>/dev/null | .build/debug/libav-play --format flac -
+cat song.opus | $LIBAV_PLAY --format opus -
+ffmpeg -i input.wav -f flac - 2>/dev/null | $LIBAV_PLAY --format flac -
 ```
 
 ### Options
