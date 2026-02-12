@@ -7,7 +7,7 @@ public final class AudioPlayer: @unchecked Sendable {
 
     // MARK: - Decoder
 
-    private let decoder = FFmpegDecoder()
+    private let decoder = Decoder()
 
     // MARK: - Concurrency
 
@@ -284,7 +284,7 @@ public final class AudioPlayer: @unchecked Sendable {
                 let position = computePlaybackPosition()
                 onProgress?(position)
 
-            } catch let error as FFmpegError where isEndOfFile(error) {
+            } catch let error as DecoderError where isEndOfFile(error) {
                 // All data decoded. Wait for audio output to finish.
                 let completed = output.waitForCompletion { [weak self] in
                     guard let self else { return true }
@@ -317,7 +317,7 @@ public final class AudioPlayer: @unchecked Sendable {
         }
     }
 
-    private func isEndOfFile(_ error: FFmpegError) -> Bool {
+    private func isEndOfFile(_ error: DecoderError) -> Bool {
         if case .endOfFile = error { return true }
         return false
     }

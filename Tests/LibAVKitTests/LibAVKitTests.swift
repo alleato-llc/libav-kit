@@ -129,12 +129,12 @@ import Testing
 
 @Test func ffmpegEncoderAvailability() {
     // FLAC should always be available
-    #expect(FFmpegEncoder.isEncoderAvailable(for: .flac) == true)
+    #expect(Encoder.isEncoderAvailable(for: .flac) == true)
 }
 
 @Test func metadataReaderThrowsForMissingFile() {
     let reader = MetadataReader()
-    #expect(throws: FFmpegError.self) {
+    #expect(throws: DecoderError.self) {
         try reader.read(url: URL(fileURLWithPath: "/nonexistent/file.flac"))
     }
 }

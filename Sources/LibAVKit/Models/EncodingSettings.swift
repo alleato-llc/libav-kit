@@ -70,7 +70,7 @@ extension EncodingSettings: Codable {
         case type, settings
     }
 
-    public init(from decoder: Decoder) throws {
+    public init(from decoder: Swift.Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let type = try container.decode(SettingsType.self, forKey: .type)
         switch type {
@@ -89,7 +89,7 @@ extension EncodingSettings: Codable {
         }
     }
 
-    public func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Swift.Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case let .flac(s):

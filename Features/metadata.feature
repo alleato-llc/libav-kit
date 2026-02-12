@@ -1,6 +1,6 @@
 Feature: Metadata Writing
   LibAVKit writes metadata tags to audio files and preserves audio properties.
-  Tags are written via CFFmpegTagWriter (stream-copy remux) and read back
+  Tags are written via TagWriter (stream-copy remux) and read back
   via MetadataReader to verify round-trip correctness.
 
   Scenario Outline: Write and read metadata tags

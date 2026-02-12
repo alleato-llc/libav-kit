@@ -104,7 +104,7 @@ struct ActionSteps: StepDefinitions {
             year: Int(match.captures[6])
         )
 
-        let writer = CFFmpegTagWriter()
+        let writer = TagWriter()
         try writer.write(to: workingCopy, changes: changes)
     }
 
@@ -118,7 +118,7 @@ struct ActionSteps: StepDefinitions {
         }
 
         let changes = MetadataChanges(title: "Test")
-        let writer = CFFmpegTagWriter()
+        let writer = TagWriter()
 
         do {
             try writer.write(to: workingCopy, changes: changes)
@@ -162,7 +162,7 @@ private func performEncode(
         destination: .folder(tempDir.url, template: nil)
     )
 
-    let encoder = FFmpegEncoder()
+    let encoder = Encoder()
     try encoder.encode(
         inputURL: inputURL,
         outputURL: outputURL,

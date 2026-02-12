@@ -37,9 +37,10 @@ PICKLE_REPORT=1 swift test --filter BDDTests
 │   ├── CFFmpeg/          # System library wrapper (module.modulemap + shim.h)
 │   └── LibAVKit/         # Public Swift API
 │       ├── Models/       # OutputFormat, ConversionConfig, EncodingSettings, etc.
-│       ├── Decoding/     # FFmpegDecoder, MetadataReader
-│       ├── Encoding/     # FFmpegEncoder, config, metadata writer
-│       ├── TagWriting/   # CFFmpegTagWriter (stream-copy remux, no re-encoding)
+│       ├── Decoding/     # Decoder, MetadataReader, DecodedFrame
+│       ├── Encoding/     # Encoder, EncoderConfig, EncoderMetadataWriter
+│       ├── Playback/     # AudioPlayer, AudioOutput protocol, AVAudioEngineOutput
+│       ├── TagWriting/   # TagWriter (stream-copy remux, no re-encoding)
 │       ├── ArtEmbedding/ # CoverArtEmbedder
 │       └── Utilities/    # VorbisPictureBlock, CustomTagParser
 ├── Features/             # Gherkin .feature files (symlinked into test target)
@@ -52,6 +53,8 @@ PICKLE_REPORT=1 swift test --filter BDDTests
 
 ## Key Conventions
 
+- **No FFmpeg prefix** — public types use domain names (`Decoder`, `Encoder`, `TagWriter`, etc.). The module qualifier `LibAVKit.Decoder` disambiguates if needed.
+- **No AVFoundation dependency** — only `AVAudioEngineOutput` imports it; everything else depends on Foundation and CFFmpeg
 - **Swift 6.2+, macOS 14.4+**
 - **CFFmpeg is internal** — only the Swift API in LibAVKit is public
 - **BDD tests use PickleKit** with Gherkin feature files and regex-based step matching

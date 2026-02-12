@@ -2,7 +2,7 @@ import CFFmpeg
 import Foundation
 
 /// Embeds or removes cover art in audio files using the C library (no CLI shelling).
-/// Uses the same remux pattern as `CFFmpegTagWriter`: open input, create output,
+/// Uses the same remux pattern as `TagWriter`: open input, create output,
 /// stream-copy all packets, then atomically replace the original.
 public final class CoverArtEmbedder: @unchecked Sendable {
     public init() {}

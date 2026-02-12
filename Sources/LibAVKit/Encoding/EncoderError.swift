@@ -1,6 +1,6 @@
 import Foundation
 
-public enum FFmpegEncoderError: Error, LocalizedError {
+public enum EncoderError: Error, LocalizedError {
     case outputFormatNotFound(String)
     case encoderNotFound(String)
     case encoderOpenFailed(String)

@@ -2,14 +2,14 @@ import CFFmpeg
 import Foundation
 
 /// Writes metadata tags to existing audio files via remuxing (no re-encoding).
-public final class CFFmpegTagWriter: @unchecked Sendable {
+public final class TagWriter: @unchecked Sendable {
     public init() {}
 
     /// Write metadata changes to a file, atomically replacing the original.
     /// Uses stream-copy (remux) to avoid any re-encoding.
     public func write(to url: URL, changes: MetadataChanges) throws {
         guard FileManager.default.fileExists(atPath: url.path) else {
-            throw CFFmpegTagWriterError.fileNotFound(url)
+            throw TagWriterError.fileNotFound(url)
         }
 
         // Create temp output URL in the same directory for atomic replace
@@ -24,7 +24,7 @@ public final class CFFmpegTagWriter: @unchecked Sendable {
         do {
             _ = try FileManager.default.replaceItemAt(url, withItemAt: tempOutputURL)
         } catch {
-            throw CFFmpegTagWriterError.atomicReplaceFailed(error.localizedDescription)
+            throw TagWriterError.atomicReplaceFailed(error.localizedDescription)
         }
     }
 
@@ -35,19 +35,19 @@ public final class CFFmpegTagWriter: @unchecked Sendable {
         var inCtxPtr: UnsafeMutablePointer<AVFormatContext>?
         guard avformat_open_input(&inCtxPtr, inputURL.path, nil, nil) == 0,
               let inCtx = inCtxPtr else {
-            throw CFFmpegTagWriterError.openInputFailed(inputURL.path)
+            throw TagWriterError.openInputFailed(inputURL.path)
         }
         defer { avformat_close_input(&inCtxPtr) }
 
         guard avformat_find_stream_info(inCtx, nil) >= 0 else {
-            throw CFFmpegTagWriterError.streamInfoFailed
+            throw TagWriterError.streamInfoFailed
         }
 
         // Create output format context
         var outCtxPtr: UnsafeMutablePointer<AVFormatContext>?
         guard avformat_alloc_output_context2(&outCtxPtr, nil, nil, outputURL.path) >= 0,
               let outCtx = outCtxPtr else {
-            throw CFFmpegTagWriterError.outputFormatFailed
+            throw TagWriterError.outputFormatFailed
         }
         defer {
             if outCtx.pointee.pb != nil {
@@ -76,11 +76,11 @@ public final class CFFmpegTagWriter: @unchecked Sendable {
             outputStreamIndex += 1
 
             guard let outStream = avformat_new_stream(outCtx, nil) else {
-                throw CFFmpegTagWriterError.streamCopyFailed
+                throw TagWriterError.streamCopyFailed
             }
 
             guard avcodec_parameters_copy(outStream.pointee.codecpar, inStream.pointee.codecpar) >= 0 else {
-                throw CFFmpegTagWriterError.streamCopyFailed
+                throw TagWriterError.streamCopyFailed
             }
 
             outStream.pointee.time_base = inStream.pointee.time_base
@@ -96,12 +96,12 @@ public final class CFFmpegTagWriter: @unchecked Sendable {
 
         // Open output file
         guard avio_open(&outCtx.pointee.pb, outputURL.path, AVIO_FLAG_WRITE) >= 0 else {
-            throw CFFmpegTagWriterError.outputOpenFailed(outputURL.path)
+            throw TagWriterError.outputOpenFailed(outputURL.path)
         }
 
         // Write header
         guard avformat_write_header(outCtx, nil) >= 0 else {
-            throw CFFmpegTagWriterError.headerWriteFailed
+            throw TagWriterError.headerWriteFailed
         }
 
         // Stream-copy all packets
@@ -127,7 +127,7 @@ public final class CFFmpegTagWriter: @unchecked Sendable {
 
             let ret = av_interleaved_write_frame(outCtx, packet)
             if ret < 0 {
-                throw CFFmpegTagWriterError.writeFailed("av_interleaved_write_frame returned \(ret)")
+                throw TagWriterError.writeFailed("av_interleaved_write_frame returned \(ret)")
             }
         }
 
@@ -185,7 +185,7 @@ public final class CFFmpegTagWriter: @unchecked Sendable {
     }
 }
 
-public enum CFFmpegTagWriterError: Error, LocalizedError {
+public enum TagWriterError: Error, LocalizedError {
     case fileNotFound(URL)
     case openInputFailed(String)
     case streamInfoFailed

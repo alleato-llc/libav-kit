@@ -10,7 +10,7 @@ public final class MetadataReader: @unchecked Sendable {
         var formatContext: UnsafeMutablePointer<AVFormatContext>?
 
         guard avformat_open_input(&formatContext, url.path, nil, nil) == 0 else {
-            throw FFmpegError.openFailed(url.path)
+            throw DecoderError.openFailed(url.path)
         }
 
         defer {
@@ -18,7 +18,7 @@ public final class MetadataReader: @unchecked Sendable {
         }
 
         guard avformat_find_stream_info(formatContext, nil) >= 0 else {
-            throw FFmpegError.streamInfoNotFound
+            throw DecoderError.streamInfoNotFound
         }
 
         // Find audio stream for codec info

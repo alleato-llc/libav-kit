@@ -35,10 +35,10 @@ Then add `LibAVKit` as a dependency to your target:
 
 ### Decoding
 
-**FFmpegDecoder** decodes audio files to raw PCM via a callback-based API. The `DecodedFrame` passed to the handler holds pointers into FFmpeg's internal frame buffer — valid only for the duration of the callback, zero-copy on the passthrough path.
+**Decoder** decodes audio files to raw PCM via a callback-based API. The `DecodedFrame` passed to the handler holds pointers into FFmpeg's internal frame buffer — valid only for the duration of the callback, zero-copy on the passthrough path.
 
 ```swift
-let decoder = FFmpegDecoder()
+let decoder = Decoder()
 decoder.configure(outputFormat: .cdQuality)
 try decoder.open(url: audioFileURL)
 
@@ -48,7 +48,7 @@ while true {
             // frame.channelData: [UnsafePointer<Float>] — planar float PCM
             // frame.frameCount, frame.sampleRate, frame.channelCount
         }
-    } catch is FFmpegError {
+    } catch is DecoderError {
         break // end of file
     }
 }
@@ -60,10 +60,10 @@ Properties available after `open()`: `duration`, `sampleRate`, `channels`, `bitr
 
 ### Encoding
 
-**FFmpegEncoder** encodes audio to compressed or lossless formats.
+**Encoder** encodes audio to compressed or lossless formats.
 
 ```swift
-let encoder = FFmpegEncoder()
+let encoder = Encoder()
 let config = ConversionConfig(
     outputFormat: .flac,
     encodingSettings: .flac(FLACEncodingSettings(compressionLevel: 5))
@@ -110,10 +110,10 @@ Reads: title, artist, album, albumArtist, year, trackNumber, discNumber, genre, 
 
 ### Tag Writing
 
-**CFFmpegTagWriter** writes metadata to audio files via stream-copy remux (no re-encoding).
+**TagWriter** writes metadata to audio files via stream-copy remux (no re-encoding).
 
 ```swift
-let writer = CFFmpegTagWriter()
+let writer = TagWriter()
 let changes = MetadataChanges(
     title: "New Title",
     artistName: "New Artist",
@@ -213,6 +213,37 @@ Playback target format specifying sample rate, channel count, sample format, and
 
 Named, reusable encoding configuration with output format, settings, and optional path template.
 
+## Demo CLI (`libav-play`)
+
+An internal CLI app that plays audio using LibAVKit. Not published as a library product — run it with `swift run`.
+
+### File mode
+
+Plays a local file using `AudioPlayer` with metadata display and progress tracking:
+
+```bash
+swift run libav-play song.flac
+swift run libav-play --volume 0.5 song.mp3
+```
+
+### STDIN mode
+
+Pipes audio through `Decoder` + `AVAudioEngineOutput` directly. Requires `--format` since FFmpeg can't detect the codec from a pipe:
+
+```bash
+cat song.opus | swift run libav-play --format opus -
+ffmpeg -i input.wav -f flac - 2>/dev/null | swift run libav-play --format flac -
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--volume` | 1.0 | Playback volume (0.0–1.0) |
+| `--format` | — | Format hint for STDIN (`flac`, `mp3`, `opus`, etc.) |
+
+Press Ctrl+C to stop playback.
+
 ## Testing
 
 ### Running Tests
@@ -274,15 +305,19 @@ Parametric audio fixtures in `Tests/LibAVKitTests/Fixtures/Parametric/` cover 36
 LibAVKit
 ├── CFFmpeg (system library, internal — not re-exported)
 ├── Models/          Value types: OutputFormat, ConversionConfig, EncodingSettings, etc.
-├── Decoding/        FFmpegDecoder, MetadataReader, DecodedFrame
-├── Encoding/        FFmpegEncoder, FFmpegEncoderConfig, EncoderMetadataWriter
+├── Decoding/        Decoder, MetadataReader, DecodedFrame
+├── Encoding/        Encoder, EncoderConfig, EncoderMetadataWriter
 ├── Playback/        AudioPlayer, AudioOutput protocol, AVAudioEngineOutput
-├── TagWriting/      CFFmpegTagWriter
+├── TagWriting/      TagWriter
 ├── ArtEmbedding/    CoverArtEmbedder
 └── Utilities/       VorbisPictureBlock, CustomTagParser
 ```
 
 The entire library is decoupled from AVFoundation. Only `AVAudioEngineOutput` imports it — every other file depends solely on Foundation and CFFmpeg. Custom `AudioOutput` implementations (Core Audio, SDL, test mocks) never need to import AVFoundation.
+
+### Naming Convention
+
+Public types use domain names without an "FFmpeg" prefix (`Decoder`, `Encoder`, `TagWriter`, `MetadataReader`, `CoverArtEmbedder`). Since every capability in this library is backed by FFmpeg, the prefix would be redundant. The `LibAVKit` module qualifier (`LibAVKit.Decoder`, `LibAVKit.Encoder`) disambiguates in the rare case of a naming collision. The one exception is `AVAudioEngineOutput`, which is prefixed to distinguish it as a concrete implementation of the `AudioOutput` protocol.
 
 ## License
 

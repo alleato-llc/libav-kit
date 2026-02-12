@@ -1,7 +1,7 @@
 import CFFmpeg
 import Foundation
 
-public enum FFmpegError: Error, LocalizedError {
+public enum DecoderError: Error, LocalizedError {
     case openFailed(String)
     case streamInfoNotFound
     case audioStreamNotFound
@@ -40,7 +40,7 @@ public enum FFmpegError: Error, LocalizedError {
 private let AV_NOPTS_VALUE: Int64 = .init(bitPattern: 0x8000_0000_0000_0000)
 private let AVERROR_EOF_VALUE: Int32 = -541_478_725
 
-public final class FFmpegDecoder: @unchecked Sendable {
+public final class Decoder: @unchecked Sendable {
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     private var swrContext: OpaquePointer?
@@ -112,7 +112,7 @@ public final class FFmpegDecoder: @unchecked Sendable {
     /// This allows changing the output format without re-opening the file
     public func reconfigure(outputFormat: AudioOutputFormat) throws {
         guard codecContext != nil else {
-            throw FFmpegError.notConfigured
+            throw DecoderError.notConfigured
         }
 
         // Update output format
@@ -134,12 +134,32 @@ public final class FFmpegDecoder: @unchecked Sendable {
         var fmtCtx: UnsafeMutablePointer<AVFormatContext>?
 
         guard avformat_open_input(&fmtCtx, path, nil, nil) == 0 else {
-            throw FFmpegError.openFailed(path)
+            throw DecoderError.openFailed(path)
         }
         formatContext = fmtCtx
 
+        try setupAfterOpen()
+    }
+
+    /// Open a raw path with an optional format hint. Use `"pipe:0"` with a
+    /// format name (e.g. `"flac"`) to read from STDIN.
+    public func open(path: String, inputFormat: String? = nil) throws {
+        close()
+
+        var fmtCtx: UnsafeMutablePointer<AVFormatContext>?
+        let fmt: UnsafePointer<AVInputFormat>? = inputFormat.flatMap { av_find_input_format($0) }
+
+        guard avformat_open_input(&fmtCtx, path, fmt, nil) == 0 else {
+            throw DecoderError.openFailed(path)
+        }
+        formatContext = fmtCtx
+
+        try setupAfterOpen()
+    }
+
+    private func setupAfterOpen() throws {
         guard avformat_find_stream_info(formatContext, nil) >= 0 else {
-            throw FFmpegError.streamInfoNotFound
+            throw DecoderError.streamInfoNotFound
         }
 
         // Find audio stream
@@ -152,7 +172,7 @@ public final class FFmpegDecoder: @unchecked Sendable {
         }
 
         guard audioStreamIndex >= 0 else {
-            throw FFmpegError.audioStreamNotFound
+            throw DecoderError.audioStreamNotFound
         }
 
         let stream = formatContext!.pointee.streams[Int(audioStreamIndex)]!
@@ -160,14 +180,14 @@ public final class FFmpegDecoder: @unchecked Sendable {
 
         // Find decoder
         guard let codec = avcodec_find_decoder(codecPar.pointee.codec_id) else {
-            throw FFmpegError.codecNotFound
+            throw DecoderError.codecNotFound
         }
 
         codecContext = avcodec_alloc_context3(codec)
         avcodec_parameters_to_context(codecContext, codecPar)
 
         guard avcodec_open2(codecContext, codec, nil) == 0 else {
-            throw FFmpegError.codecOpenFailed
+            throw DecoderError.codecOpenFailed
         }
 
         // Extract metadata
@@ -220,12 +240,12 @@ public final class FFmpegDecoder: @unchecked Sendable {
         )
 
         guard result >= 0, let swr = swrCtx else {
-            throw FFmpegError.resamplerfailed
+            throw DecoderError.resamplerfailed
         }
 
         guard swr_init(swr) >= 0 else {
             swr_free(&swrCtx)
-            throw FFmpegError.resamplerfailed
+            throw DecoderError.resamplerfailed
         }
 
         swrContext = swr
@@ -254,19 +274,19 @@ public final class FFmpegDecoder: @unchecked Sendable {
 
     /// Decode the next frame and pass raw audio data to the handler via ``DecodedFrame``.
     /// The frame's pointers are only valid for the duration of the callback.
-    /// Throws ``FFmpegError/endOfFile`` when no more data is available.
+    /// Throws ``DecoderError/endOfFile`` when no more data is available.
     public func decodeNextFrame(handler: (DecodedFrame) throws -> Void) throws {
         guard let formatContext,
               let codecContext,
               let packet,
               let frame else {
-            throw FFmpegError.decodeFailed
+            throw DecoderError.decodeFailed
         }
 
         while true {
             let readResult = av_read_frame(formatContext, packet)
             if readResult == AVERROR_EOF_VALUE || readResult == -EAGAIN {
-                throw FFmpegError.endOfFile
+                throw DecoderError.endOfFile
             }
 
             defer { av_packet_unref(packet) }
@@ -284,7 +304,7 @@ public final class FFmpegDecoder: @unchecked Sendable {
                     break
                 }
                 if receiveResult < 0 {
-                    throw FFmpegError.decodeFailed
+                    throw DecoderError.decodeFailed
                 }
 
                 defer { av_frame_unref(frame) }

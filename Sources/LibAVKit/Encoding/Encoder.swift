@@ -2,16 +2,16 @@ import CFFmpeg
 import Foundation
 
 /// FFmpeg-based audio encoder supporting all formats available through libavcodec
-public final class FFmpegEncoder: @unchecked Sendable {
+public final class Encoder: @unchecked Sendable {
     public init() {}
 }
 
 // MARK: - Encode Context
 
-private extension FFmpegEncoder {
+private extension Encoder {
     /// Groups the parameters needed by the encode loop into a single value
     struct EncodeContext {
-        let decoder: FFmpegDecoder
+        let decoder: Decoder
         let encCtx: UnsafeMutablePointer<AVCodecContext>
         let outFmtCtx: UnsafeMutablePointer<AVFormatContext>
         let outStream: UnsafeMutablePointer<AVStream>
@@ -27,14 +27,14 @@ private extension FFmpegEncoder {
 
 // MARK: - Public API
 
-extension FFmpegEncoder {
+extension Encoder {
     public static var supportedFormats: Set<OutputFormat> {
         Set(OutputFormat.allCases.filter { isEncoderAvailable(for: $0) })
     }
 
     /// Check whether the FFmpeg encoder for a given output format is available at runtime
     public static func isEncoderAvailable(for format: OutputFormat) -> Bool {
-        let encoder = FFmpegEncoder()
+        let encoder = Encoder()
         let spec = encoder.encoderSpec(for: format)
         if let name = spec.encoderName {
             return avcodec_find_encoder_by_name(name) != nil
@@ -51,7 +51,7 @@ extension FFmpegEncoder {
         isCancelled: @escaping @Sendable () -> Bool
     ) throws {
         // 1. Open input and determine source parameters
-        let decoder = FFmpegDecoder()
+        let decoder = Decoder()
         try decoder.open(url: inputURL)
 
         let sourceDuration = decoder.duration
@@ -115,7 +115,7 @@ extension FFmpegEncoder {
 
         // 5. Write header
         guard avformat_write_header(outFmtCtx, nil) >= 0 else {
-            throw FFmpegEncoderError.headerWriteFailed
+            throw EncoderError.headerWriteFailed
         }
 
         // 5b. Write cover art packet (after header, before audio data)
@@ -148,7 +148,7 @@ extension FFmpegEncoder {
 
 // MARK: - Encoding Pipeline Steps
 
-private extension FFmpegEncoder {
+private extension Encoder {
     func setupOutputContext(
         spec: EncoderSpec,
         config: ConversionConfig,
@@ -169,7 +169,7 @@ private extension FFmpegEncoder {
             &outputFmtCtx, nil, spec.containerFormat, outputPath
         )
         guard ret >= 0, let outFmtCtx = outputFmtCtx else {
-            throw FFmpegEncoderError.outputFormatNotFound(config.outputFormat.fileExtension)
+            throw EncoderError.outputFormatNotFound(config.outputFormat.fileExtension)
         }
 
         // Find encoder and create stream
@@ -214,19 +214,19 @@ private extension FFmpegEncoder {
 
         guard let enc = encoder else {
             avformat_free_context(outFmtCtx)
-            throw FFmpegEncoderError.encoderNotFound(
+            throw EncoderError.encoderNotFound(
                 spec.encoderName ?? String(cString: avcodec_get_name(spec.codecId))
             )
         }
 
         guard let outStream = avformat_new_stream(outFmtCtx, enc) else {
             avformat_free_context(outFmtCtx)
-            throw FFmpegEncoderError.encoderOpenFailed("Failed to create output stream")
+            throw EncoderError.encoderOpenFailed("Failed to create output stream")
         }
 
         guard let encCtxPtr = avcodec_alloc_context3(enc) else {
             avformat_free_context(outFmtCtx)
-            throw FFmpegEncoderError.encoderOpenFailed("Failed to allocate encoder context")
+            throw EncoderError.encoderOpenFailed("Failed to allocate encoder context")
         }
 
         if let supportedFmts = enc.pointee.sample_fmts {
@@ -253,7 +253,7 @@ private extension FFmpegEncoder {
                 var ctx: UnsafeMutablePointer<AVCodecContext>? = encCtxPtr
                 avcodec_free_context(&ctx)
                 avformat_free_context(outFmtCtx)
-                throw FFmpegEncoderError.unsupportedSampleRate(
+                throw EncoderError.unsupportedSampleRate(
                     requested: Int(outSampleRate),
                     supported: rates.sorted(),
                     encoder: String(cString: enc.pointee.name)
@@ -288,7 +288,7 @@ private extension FFmpegEncoder {
             var ctx: UnsafeMutablePointer<AVCodecContext>? = encCtxPtr
             avcodec_free_context(&ctx)
             avformat_free_context(outFmtCtx)
-            throw FFmpegEncoderError.encoderOpenFailed(
+            throw EncoderError.encoderOpenFailed(
                 "avcodec_open2 returned \(ret) (encoder \(encoderName), "
                     + "rate=\(sampleRate), fmt=\(sampleFmt), ch=\(channels))"
             )
@@ -299,7 +299,7 @@ private extension FFmpegEncoder {
             var ctx: UnsafeMutablePointer<AVCodecContext>? = encCtxPtr
             avcodec_free_context(&ctx)
             avformat_free_context(outFmtCtx)
-            throw FFmpegEncoderError.encoderOpenFailed("Failed to copy codec parameters")
+            throw EncoderError.encoderOpenFailed("Failed to copy codec parameters")
         }
 
         outStream.pointee.time_base = encCtxPtr.pointee.time_base
@@ -310,7 +310,7 @@ private extension FFmpegEncoder {
                 var ctx: UnsafeMutablePointer<AVCodecContext>? = encCtxPtr
                 avcodec_free_context(&ctx)
                 avformat_free_context(outFmtCtx)
-                throw FFmpegEncoderError.outputOpenFailed(outputPath)
+                throw EncoderError.outputOpenFailed(outputPath)
             }
         }
     }
@@ -344,12 +344,12 @@ private extension FFmpegEncoder {
         )
 
         guard ret >= 0, let swr = swrCtx else {
-            throw FFmpegEncoderError.resamplerFailed
+            throw EncoderError.resamplerFailed
         }
 
         guard swr_init(swr) >= 0 else {
             swr_free(&swrCtx)
-            throw FFmpegEncoderError.resamplerFailed
+            throw EncoderError.resamplerFailed
         }
 
         return swrCtx
@@ -360,7 +360,7 @@ private extension FFmpegEncoder {
         var encodePacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
 
         guard encodeFrame != nil, encodePacket != nil else {
-            throw FFmpegEncoderError.encodingFailed("Failed to allocate frame or packet")
+            throw EncoderError.encodingFailed("Failed to allocate frame or packet")
         }
 
         defer {
@@ -376,7 +376,7 @@ private extension FFmpegEncoder {
         if frameSize > 0 {
             fifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP, ctx.outChannels, frameSize)
             guard fifo != nil else {
-                throw FFmpegEncoderError.encodingFailed("Failed to allocate audio FIFO")
+                throw EncoderError.encodingFailed("Failed to allocate audio FIFO")
             }
         }
         defer { if let fifo { av_audio_fifo_free(fifo) } }
@@ -386,14 +386,14 @@ private extension FFmpegEncoder {
 
         var decodeFinished = false
         while !decodeFinished {
-            if ctx.isCancelled() { throw FFmpegEncoderError.cancelled }
+            if ctx.isCancelled() { throw EncoderError.cancelled }
 
             do {
                 try ctx.decoder.decodeNextFrame { frame in
                     guard frame.frameCount > 0 else { return }
 
                     guard let framePtr = encodeFrame, let packetPtr = encodePacket else {
-                        throw FFmpegEncoderError.encodingFailed("Frame or packet deallocated unexpectedly")
+                        throw EncoderError.encodingFailed("Frame or packet deallocated unexpectedly")
                     }
 
                     if let fifo {
@@ -421,7 +421,7 @@ private extension FFmpegEncoder {
                         ctx.progress(min(1.0, Double(totalSamplesEncoded) / Double(totalExpectedSamples)))
                     }
                 }
-            } catch FFmpegError.endOfFile {
+            } catch DecoderError.endOfFile {
                 decodeFinished = true
             }
         }
@@ -479,7 +479,7 @@ private extension FFmpegEncoder {
         // Allocate a temporary FLTP frame to read FIFO data into
         var readFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         guard let tempFrame = readFrame else {
-            throw FFmpegEncoderError.encodingFailed("Failed to allocate FIFO read frame")
+            throw EncoderError.encodingFailed("Failed to allocate FIFO read frame")
         }
         defer { av_frame_free(&readFrame) }
 
@@ -488,7 +488,7 @@ private extension FFmpegEncoder {
         tempFrame.pointee.sample_rate = ctx.outSampleRate
         av_channel_layout_default(&tempFrame.pointee.ch_layout, ctx.outChannels)
         guard av_frame_get_buffer(tempFrame, 0) >= 0 else {
-            throw FFmpegEncoderError.encodingFailed("Failed to allocate FIFO read frame buffer")
+            throw EncoderError.encodingFailed("Failed to allocate FIFO read frame buffer")
         }
 
         // Read from FIFO into the temporary frame
@@ -499,7 +499,7 @@ private extension FFmpegEncoder {
             av_audio_fifo_read(fifo, buf.baseAddress, chunkSize)
         }
         guard readCount > 0 else {
-            throw FFmpegEncoderError.encodingFailed("Failed to read from audio FIFO")
+            throw EncoderError.encodingFailed("Failed to read from audio FIFO")
         }
         tempFrame.pointee.nb_samples = readCount
 
@@ -614,10 +614,10 @@ private extension FFmpegEncoder {
         av_channel_layout_copy(&framePtr.pointee.ch_layout, &encCtx.pointee.ch_layout)
 
         guard av_frame_get_buffer(framePtr, 0) >= 0 else {
-            throw FFmpegEncoderError.encodingFailed("Failed to allocate encode frame buffer")
+            throw EncoderError.encodingFailed("Failed to allocate encode frame buffer")
         }
         guard av_frame_make_writable(framePtr) >= 0 else {
-            throw FFmpegEncoderError.encodingFailed("Failed to make frame writable")
+            throw EncoderError.encodingFailed("Failed to make frame writable")
         }
     }
 
@@ -673,7 +673,7 @@ private extension FFmpegEncoder {
     ) throws {
         var ret = avcodec_send_frame(encCtx, frame)
         if ret < 0, ret != -EAGAIN {
-            throw FFmpegEncoderError.encodingFailed("avcodec_send_frame returned \(ret)")
+            throw EncoderError.encodingFailed("avcodec_send_frame returned \(ret)")
         }
 
         while true {
@@ -682,7 +682,7 @@ private extension FFmpegEncoder {
                 break
             }
             if ret < 0 {
-                throw FFmpegEncoderError.encodingFailed("avcodec_receive_packet returned \(ret)")
+                throw EncoderError.encodingFailed("avcodec_receive_packet returned \(ret)")
             }
 
             av_packet_rescale_ts(packet, encCtx.pointee.time_base, outStream.pointee.time_base)
@@ -692,7 +692,7 @@ private extension FFmpegEncoder {
             av_packet_unref(packet)
 
             if ret < 0 {
-                throw FFmpegEncoderError.encodingFailed("av_interleaved_write_frame returned \(ret)")
+                throw EncoderError.encodingFailed("av_interleaved_write_frame returned \(ret)")
             }
         }
     }

@@ -2,7 +2,7 @@ import CFFmpeg
 
 // MARK: - Codec Mapping
 
-extension FFmpegEncoder {
+extension Encoder {
     struct EncoderSpec {
         let codecId: AVCodecID
         let encoderName: String?
@@ -79,7 +79,7 @@ extension FFmpegEncoder {
 
 // MARK: - Bitrate Configuration
 
-extension FFmpegEncoder {
+extension Encoder {
     func configureBitrate(
         encCtx: UnsafeMutablePointer<AVCodecContext>,
         config: ConversionConfig,
