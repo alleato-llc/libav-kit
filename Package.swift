@@ -10,7 +10,7 @@ let package = Package(
         .library(name: "LibAVKit", targets: ["LibAVKit"]),
     ],
     dependencies: [
-        .package(url: "git@github.com:nycjv321/pickle-kit.git", branch: "main"),
+        .package(url: "git@github.com:aalleato/pickle-kit.git", branch: "main"),
     ],
     targets: [
         .systemLibrary(

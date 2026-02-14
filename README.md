@@ -248,7 +248,7 @@ swift test --skip BDDTests
 | `cover_art.feature` | 12 | Embed and remove across 6 supported codecs |
 | `metadata.feature` | 11 | Tag write/read round-trip for all codecs |
 
-Uses [PickleKit](https://github.com/nycjv321/pickle-kit) with the Swift Testing bridge (`GherkinTestScenario`).
+Uses [PickleKit](https://github.com/aalleato/pickle-kit) with the Swift Testing bridge (`GherkinTestScenario`).
 
 ### Filtering Scenarios
 
