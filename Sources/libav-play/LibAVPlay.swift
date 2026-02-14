@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import LibAVKit
+import Tint
 
 @main
 struct LibAVPlay: ParsableCommand {
@@ -31,7 +32,12 @@ struct LibAVPlay: ParsableCommand {
         if isSTDIN {
             try runSTDINMode()
         } else if let file {
-            try runFileMode(path: file)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: file, isDirectory: &isDir), isDir.boolValue {
+                runTUIMode(directory: URL(fileURLWithPath: file))
+            } else {
+                try runFileMode(path: file)
+            }
         } else {
             print("No file specified. Use --help for usage.")
             throw ExitCode.failure
@@ -190,6 +196,36 @@ struct LibAVPlay: ParsableCommand {
         }
 
         dispatchMain()
+    }
+
+    // MARK: - TUI Mode (Directory browser)
+
+    private func runTUIMode(directory: URL) {
+        print("Scanning library at \(directory.path)...")
+        let albums = LibraryIndex.scan(directory: directory)
+        guard !albums.isEmpty else {
+            print("No audio files found in \(directory.path)")
+            return
+        }
+        print("Found \(albums.count) album(s), \(albums.reduce(0) { $0 + $1.trackCount }) track(s). Launching TUI...")
+
+        let theme = PlayerTheme()
+        let output = AVAudioEngineOutput()
+        let player = AudioPlayer(output: output)
+        player.volume = volume
+        let state = PlayerState(albums: albums, player: player)
+
+        output.onSamples = { [weak state] samples in
+            state?.sampleBuffer.write(samples)
+        }
+
+        let app = Application(theme: theme)
+
+        app.run(render: { area, buffer in
+            AppRenderer.render(state: state, area: area, theme: theme, buffer: &buffer)
+        }, onKey: { key in
+            KeyHandler.handle(key: key, state: state, app: app)
+        })
     }
 }
 

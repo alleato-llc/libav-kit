@@ -12,6 +12,7 @@ let package = Package(
     dependencies: [
         .package(url: "git@github.com:nycjv321/pickle-kit.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
+        .package(path: "../tint"),
     ],
     targets: [
         .systemLibrary(
@@ -34,6 +35,7 @@ let package = Package(
             name: "libav-play",
             dependencies: [
                 "LibAVKit",
+                .product(name: "Tint", package: "tint"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/libav-play"

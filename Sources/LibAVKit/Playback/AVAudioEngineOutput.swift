@@ -7,6 +7,10 @@ public final class AVAudioEngineOutput: AudioOutput, @unchecked Sendable {
     private let playerNode = AVAudioPlayerNode()
     private var cachedFormat: AVAudioFormat?
 
+    /// Optional callback that receives real-time PCM samples (channel 0, Float32)
+    /// from a tap on the main mixer node. Called on the audio render thread.
+    public var onSamples: (([Float]) -> Void)?
+
     public init() {
         engine.attach(playerNode)
     }
@@ -28,6 +32,14 @@ public final class AVAudioEngineOutput: AudioOutput, @unchecked Sendable {
         cachedFormat = audioFormat
         engine.connect(playerNode, to: engine.mainMixerNode, format: audioFormat)
 
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
+            guard let callback = self?.onSamples,
+                  let floatData = buffer.floatChannelData else { return }
+            let frameCount = Int(buffer.frameLength)
+            let samples = Array(UnsafeBufferPointer(start: floatData[0], count: frameCount))
+            callback(samples)
+        }
+
         do {
             try engine.start()
         } catch {
@@ -44,6 +56,7 @@ public final class AVAudioEngineOutput: AudioOutput, @unchecked Sendable {
     }
 
     public func stop() {
+        engine.mainMixerNode.removeTap(onBus: 0)
         if engine.isRunning {
             engine.stop()
         }
@@ -76,14 +89,12 @@ public final class AVAudioEngineOutput: AudioOutput, @unchecked Sendable {
             semaphore.signal()
         }
 
-        let deadline = DispatchTime.now() + .seconds(60)
-        while DispatchTime.now() < deadline {
+        while true {
             if semaphore.wait(timeout: .now() + .milliseconds(50)) == .success {
                 return true
             }
             if checkCancelled() { return false }
         }
-        return false
     }
 
     public var playbackPosition: TimeInterval {
