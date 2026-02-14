@@ -144,6 +144,111 @@ extension Encoder {
         decoder.close()
         progress(1.0)
     }
+
+    /// Encode programmatically-generated float samples to an audio file.
+    ///
+    /// Unlike `encode(inputURL:...)`, this method accepts raw planar float data
+    /// directly — no input file or Decoder needed. Useful for generating test
+    /// fixtures from synthesized audio (e.g. `SineWaveGenerator`).
+    ///
+    /// - Parameters:
+    ///   - samples: Planar float data `[channel][sample]`. All channels must have equal length.
+    ///   - sampleRate: Sample rate in Hz (e.g. 44100)
+    ///   - outputURL: Destination file URL
+    ///   - config: Encoding configuration (format, settings, optional overrides)
+    ///   - metadata: Optional metadata tags to embed
+    ///   - progress: Progress callback (0.0–1.0)
+    ///   - isCancelled: Cancellation check
+    public func encode(
+        samples: [[Float]],
+        sampleRate: Int,
+        outputURL: URL,
+        config: ConversionConfig,
+        metadata: AudioMetadata? = nil,
+        progress: @escaping @Sendable (Double) -> Void = { _ in },
+        isCancelled: @escaping @Sendable () -> Bool = { false }
+    ) throws {
+        guard !samples.isEmpty, let sampleCount = samples.first?.count, sampleCount > 0 else {
+            throw EncoderError.encodingFailed("No samples provided")
+        }
+        let channelCount = samples.count
+
+        let outSampleRate = Int32(config.sampleRate ?? sampleRate)
+        let outChannels = Int32(config.channels ?? channelCount)
+        let effectiveBitDepth = config.bitDepth ?? 16
+
+        // Setup output format context and encoder
+        let spec = encoderSpec(for: config.outputFormat, bitDepth: effectiveBitDepth)
+        let (outFmtCtx, encCtxPtr, outStream) = try setupOutputContext(
+            spec: spec,
+            config: config,
+            outputURL: outputURL,
+            outSampleRate: outSampleRate,
+            outChannels: outChannels,
+            effectiveBitDepth: effectiveBitDepth
+        )
+
+        defer {
+            var encCtx: UnsafeMutablePointer<AVCodecContext>? = encCtxPtr
+            if outFmtCtx.pointee.pb != nil {
+                avio_closep(&outFmtCtx.pointee.pb)
+            }
+            avformat_free_context(outFmtCtx)
+            avcodec_free_context(&encCtx)
+        }
+
+        // Setup resampler if encoder needs non-FLTP format
+        var swrCtx = try setupResampler(
+            encCtx: encCtxPtr,
+            outSampleRate: outSampleRate,
+            outChannels: outChannels
+        )
+        let needsResample = swrCtx != nil
+        defer { if swrCtx != nil { swr_free(&swrCtx) } }
+
+        // Write metadata
+        var coverArtStreamIndex: Int32?
+        let metadataWriter = EncoderMetadataWriter()
+        if let metadata {
+            metadataWriter.write(metadata: metadata, to: outFmtCtx)
+            if let coverArt = metadata.coverArt {
+                if config.outputFormat.usesOggContainer {
+                    metadataWriter.addCoverArtAsVorbisComment(coverArt, to: outFmtCtx)
+                } else {
+                    coverArtStreamIndex = metadataWriter.addCoverArtStream(
+                        coverArt, to: outFmtCtx, outputFormat: config.outputFormat
+                    )
+                }
+            }
+        }
+
+        // Write header
+        guard avformat_write_header(outFmtCtx, nil) >= 0 else {
+            throw EncoderError.headerWriteFailed
+        }
+        if let coverArt = metadata?.coverArt, let artStreamIdx = coverArtStreamIndex {
+            metadataWriter.writeCoverArtPacket(coverArt, to: outFmtCtx, streamIndex: artStreamIdx)
+        }
+
+        // Encode samples in chunks
+        try rawEncodeLoop(
+            samples: samples,
+            sampleCount: sampleCount,
+            channelCount: Int32(channelCount),
+            encCtx: encCtxPtr,
+            outFmtCtx: outFmtCtx,
+            outStream: outStream,
+            swrCtx: swrCtx,
+            needsResample: needsResample,
+            outSampleRate: outSampleRate,
+            outChannels: outChannels,
+            progress: progress,
+            isCancelled: isCancelled
+        )
+
+        av_write_trailer(outFmtCtx)
+        progress(1.0)
+    }
 }
 
 // MARK: - Encoding Pipeline Steps
@@ -740,6 +845,187 @@ private extension Encoder {
             AV_SAMPLE_FMT_DBL
         default:
             AV_SAMPLE_FMT_FLTP
+        }
+    }
+
+    // MARK: - Raw Encode Loop
+
+    func rawEncodeLoop(
+        samples: [[Float]],
+        sampleCount: Int,
+        channelCount: Int32,
+        encCtx: UnsafeMutablePointer<AVCodecContext>,
+        outFmtCtx: UnsafeMutablePointer<AVFormatContext>,
+        outStream: UnsafeMutablePointer<AVStream>,
+        swrCtx: OpaquePointer?,
+        needsResample: Bool,
+        outSampleRate: Int32,
+        outChannels: Int32,
+        progress: @Sendable (Double) -> Void,
+        isCancelled: @Sendable () -> Bool
+    ) throws {
+        var encodeFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        var encodePacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+
+        guard encodeFrame != nil, encodePacket != nil else {
+            throw EncoderError.encodingFailed("Failed to allocate frame or packet")
+        }
+
+        defer {
+            av_frame_free(&encodeFrame)
+            av_packet_free(&encodePacket)
+        }
+
+        let frameSize = encCtx.pointee.frame_size
+        // Use frame_size for fixed-frame codecs, or 4096 as default chunk for variable codecs
+        let chunkSize = frameSize > 0 ? Int(frameSize) : 4096
+
+        // For fixed-frame codecs, use FIFO to accumulate exact frame_size chunks
+        var fifo: OpaquePointer?
+        if frameSize > 0 {
+            fifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP, outChannels, frameSize)
+            guard fifo != nil else {
+                throw EncoderError.encodingFailed("Failed to allocate audio FIFO")
+            }
+        }
+        defer { if let fifo { av_audio_fifo_free(fifo) } }
+
+        var totalSamplesEncoded: Int64 = 0
+        var offset = 0
+
+        while offset < sampleCount {
+            if isCancelled() { throw EncoderError.cancelled }
+
+            let remaining = sampleCount - offset
+            let thisChunk = min(chunkSize, remaining)
+
+            guard let framePtr = encodeFrame, let packetPtr = encodePacket else {
+                throw EncoderError.encodingFailed("Frame or packet deallocated unexpectedly")
+            }
+
+            if let fifo {
+                // Write this chunk into the FIFO
+                writeRawSamplesToFifo(
+                    fifo, samples: samples, offset: offset,
+                    count: thisChunk, channels: channelCount
+                )
+
+                // Drain full frames from FIFO
+                while av_audio_fifo_size(fifo) >= frameSize {
+                    totalSamplesEncoded += try encodeFromFifo(
+                        ctx: EncodeContext(
+                            decoder: Decoder(), encCtx: encCtx,
+                            outFmtCtx: outFmtCtx, outStream: outStream,
+                            swrCtx: swrCtx, needsResample: needsResample,
+                            outSampleRate: outSampleRate, outChannels: outChannels,
+                            sourceDuration: 0, progress: { _ in }, isCancelled: { false }
+                        ),
+                        fifo: fifo, chunkSize: frameSize,
+                        framePtr: framePtr, packetPtr: packetPtr,
+                        ptsOffset: totalSamplesEncoded
+                    )
+                }
+            } else {
+                // Variable frame_size: encode chunk directly
+                try prepareEncodeFrame(
+                    framePtr: framePtr, encCtx: encCtx,
+                    frameCount: Int32(thisChunk), outSampleRate: outSampleRate
+                )
+                framePtr.pointee.pts = totalSamplesEncoded
+
+                if needsResample, let swr = swrCtx {
+                    // Build input pointers from raw samples
+                    let inPtrs: [UnsafePointer<UInt8>?] = (0..<Int(channelCount)).map { ch in
+                        samples[ch].withUnsafeBufferPointer { buf in
+                            UnsafeRawPointer(buf.baseAddress! + offset)
+                                .assumingMemoryBound(to: UInt8.self)
+                        }
+                    }
+                    inPtrs.withUnsafeBufferPointer { inBuf in
+                        var outPtrs: [UnsafeMutablePointer<UInt8>?] = (0..<Int(outChannels)).map { ch in
+                            framePtr.pointee.extended_data[ch]
+                        }
+                        outPtrs.withUnsafeMutableBufferPointer { outBuf in
+                            let converted = swr_convert(
+                                swr, outBuf.baseAddress, Int32(thisChunk),
+                                inBuf.baseAddress, Int32(thisChunk)
+                            )
+                            if converted > 0 {
+                                framePtr.pointee.nb_samples = converted
+                            }
+                        }
+                    }
+                } else {
+                    // Direct copy: FLTP data into encode frame
+                    for ch in 0..<Int(min(channelCount, outChannels)) {
+                        if let dst = framePtr.pointee.extended_data[ch] {
+                            samples[ch].withUnsafeBufferPointer { buf in
+                                let src = UnsafeRawPointer(buf.baseAddress! + offset)
+                                dst.update(
+                                    from: src.assumingMemoryBound(to: UInt8.self),
+                                    count: thisChunk * MemoryLayout<Float>.size
+                                )
+                            }
+                        }
+                    }
+                }
+
+                totalSamplesEncoded += Int64(framePtr.pointee.nb_samples)
+
+                try sendFrameAndWritePackets(
+                    encCtx: encCtx, frame: framePtr, packet: packetPtr,
+                    outFmtCtx: outFmtCtx, outStream: outStream
+                )
+                av_frame_unref(framePtr)
+            }
+
+            offset += thisChunk
+            progress(Double(offset) / Double(sampleCount))
+        }
+
+        // Flush remaining samples from FIFO
+        if let fifo, let framePtr = encodeFrame, let packetPtr = encodePacket {
+            let remaining = av_audio_fifo_size(fifo)
+            if remaining > 0 {
+                let dummyCtx = EncodeContext(
+                    decoder: Decoder(), encCtx: encCtx,
+                    outFmtCtx: outFmtCtx, outStream: outStream,
+                    swrCtx: swrCtx, needsResample: needsResample,
+                    outSampleRate: outSampleRate, outChannels: outChannels,
+                    sourceDuration: 0, progress: { _ in }, isCancelled: { false }
+                )
+                totalSamplesEncoded += try encodeFromFifo(
+                    ctx: dummyCtx, fifo: fifo, chunkSize: remaining,
+                    framePtr: framePtr, packetPtr: packetPtr,
+                    ptsOffset: totalSamplesEncoded
+                )
+            }
+        }
+
+        // Flush encoder
+        if let packetPtr = encodePacket {
+            try sendFrameAndWritePackets(
+                encCtx: encCtx, frame: nil, packet: packetPtr,
+                outFmtCtx: outFmtCtx, outStream: outStream
+            )
+        }
+    }
+
+    /// Write raw planar float samples into the audio FIFO.
+    func writeRawSamplesToFifo(
+        _ fifo: OpaquePointer,
+        samples: [[Float]],
+        offset: Int,
+        count: Int,
+        channels: Int32
+    ) {
+        var ptrs: [UnsafeMutableRawPointer?] = (0..<Int(channels)).map { ch in
+            samples[ch].withUnsafeBufferPointer { buf in
+                UnsafeMutableRawPointer(mutating: buf.baseAddress! + offset)
+            }
+        }
+        ptrs.withUnsafeMutableBufferPointer { buf in
+            _ = av_audio_fifo_write(fifo, buf.baseAddress, Int32(count))
         }
     }
 }

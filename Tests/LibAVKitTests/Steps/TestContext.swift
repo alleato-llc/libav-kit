@@ -16,6 +16,11 @@ final class TestContext: @unchecked Sendable {
     var coverArtData: Data?
     var writeError: (any Error)?
 
+    // Raw encoding
+    var rawSamples: [[Float]]?
+    var rawSampleRate: Int?
+    var rawMetadata: AudioMetadata?
+
     // Playback
     var player: AudioPlayer?
     var playbackError: (any Error)?
@@ -32,6 +37,9 @@ final class TestContext: @unchecked Sendable {
         outputMetadata = nil
         coverArtData = nil
         writeError = nil
+        rawSamples = nil
+        rawSampleRate = nil
+        rawMetadata = nil
         player = nil
         playbackError = nil
         stateTransitions = []

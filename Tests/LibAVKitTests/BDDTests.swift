@@ -22,6 +22,7 @@ struct BDDTests {
             ActionSteps.self,
             VerificationSteps.self,
             PlaybackSteps.self,
+            RawEncodingSteps.self,
         ])
 
         #expect(result.passed, "Scenario '\(test.description)' failed: \(failureDetails(result))")
