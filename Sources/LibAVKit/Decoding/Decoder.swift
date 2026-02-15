@@ -1,6 +1,10 @@
 import CFFmpeg
 import Foundation
 
+#if canImport(Accelerate)
+import Accelerate
+#endif
+
 public enum DecoderError: Error, LocalizedError {
     case openFailed(String)
     case streamInfoNotFound
@@ -51,8 +55,24 @@ public final class Decoder: @unchecked Sendable {
     private var outputChannels: Int32 = 2
     private var outputSampleFormat: AVSampleFormat = AV_SAMPLE_FMT_FLT
 
-    /// Track if we're in passthrough mode (no resampling needed)
-    private var isPassthrough: Bool = false
+    /// How decoded frames are converted to the output format.
+    private enum ConversionMode {
+        case passthrough      // Source is already FLTP — zero-copy pointer forwarding
+        case fastS32PToFloat  // Source is S32P (planar) — vDSP SIMD, stride 1
+        case fastS16PToFloat  // Source is S16P (planar) — vDSP SIMD, stride 1
+        case fastS32ToFloat   // Source is S32 (interleaved) — vDSP SIMD, stride N
+        case fastS16ToFloat   // Source is S16 (interleaved) — vDSP SIMD, stride N
+        case resample         // Everything else — FFmpeg swr generic resampler
+    }
+    private var conversionMode: ConversionMode = .resample
+
+    /// Pre-allocated resample output buffers (one per channel), reused across frames
+    private var resampleBuffers: [UnsafeMutablePointer<Float>] = []
+    private var resampleBufferCapacity: Int = 0
+
+    /// Cached channel pointer array — mutated in-place to avoid per-frame allocation.
+    /// COW is safe: DecodedFrame is dropped before next mutation (refcount 1 at mutation time).
+    private var cachedChannelPointers: [UnsafePointer<Float>] = []
 
     // Source format information (populated after open)
     public private(set) var duration: TimeInterval = 0
@@ -214,14 +234,40 @@ public final class Decoder: @unchecked Sendable {
     private func setupResampler() throws {
         guard let ctx = codecContext else { return }
 
-        // Check if we can use passthrough mode (no resampling)
-        isPassthrough = checkPassthrough(ctx)
+        let sourceFmt = ctx.pointee.sample_fmt
+        let sourceRate = ctx.pointee.sample_rate
+        let sourceChannels = ctx.pointee.ch_layout.nb_channels
 
-        if isPassthrough {
-            // No resampler needed
-            swrContext = nil
-            return
+        // Fast paths when sample rate and channel count already match output
+        if sourceRate == outputSampleRate && sourceChannels == outputChannels {
+            // Passthrough: source is already float32 planar
+            if sourceFmt == AV_SAMPLE_FMT_FLTP || sourceFmt == outputSampleFormat {
+                conversionMode = .passthrough
+                swrContext = nil
+                return
+            }
+
+            // vDSP SIMD conversion: integer → float32 planar (no swr needed)
+            #if canImport(Accelerate)
+            if outputSampleFormat == AV_SAMPLE_FMT_FLTP {
+                switch sourceFmt {
+                case AV_SAMPLE_FMT_S32P:
+                    conversionMode = .fastS32PToFloat; swrContext = nil; return
+                case AV_SAMPLE_FMT_S16P:
+                    conversionMode = .fastS16PToFloat; swrContext = nil; return
+                case AV_SAMPLE_FMT_S32:
+                    conversionMode = .fastS32ToFloat; swrContext = nil; return
+                case AV_SAMPLE_FMT_S16:
+                    conversionMode = .fastS16ToFloat; swrContext = nil; return
+                default:
+                    break
+                }
+            }
+            #endif
         }
+
+        // Fallback: generic FFmpeg resampler
+        conversionMode = .resample
 
         var outLayout = AVChannelLayout()
         av_channel_layout_default(&outLayout, outputChannels)
@@ -251,25 +297,18 @@ public final class Decoder: @unchecked Sendable {
         swrContext = swr
     }
 
-    private func checkPassthrough(_ ctx: UnsafeMutablePointer<AVCodecContext>) -> Bool {
-        // Check if source format matches configured output format
-        let sourceSampleRate = ctx.pointee.sample_rate
-        let sourceChannels = ctx.pointee.ch_layout.nb_channels
-        let sourceSampleFmt = ctx.pointee.sample_fmt
-
-        // For passthrough, sample rate and channels must match
-        guard sourceSampleRate == outputSampleRate,
-              sourceChannels == outputChannels else {
-            return false
+    /// Ensure pre-allocated resample buffers have the required capacity.
+    /// Uses amortized doubling — only reallocates when frame size exceeds current capacity.
+    private func ensureResampleBuffers(channelCount: Int, minCapacity: Int) {
+        if resampleBuffers.count == channelCount && resampleBufferCapacity >= minCapacity {
+            return
         }
-
-        // Sample format must be float32 planar (our standard output format for AVAudioEngine)
-        // or match exactly
-        if sourceSampleFmt == AV_SAMPLE_FMT_FLTP || sourceSampleFmt == outputSampleFormat {
-            return true
-        }
-
-        return false
+        // Free old buffers
+        for buf in resampleBuffers { buf.deallocate() }
+        // Allocate with headroom to avoid frequent reallocs
+        let capacity = max(minCapacity, resampleBufferCapacity * 2)
+        resampleBuffers = (0..<channelCount).map { _ in .allocate(capacity: capacity) }
+        resampleBufferCapacity = capacity
     }
 
     /// Decode the next frame and pass raw audio data to the handler via ``DecodedFrame``.
@@ -309,16 +348,72 @@ public final class Decoder: @unchecked Sendable {
 
                 defer { av_frame_unref(frame) }
 
-                if isPassthrough {
-                    if let decoded = passthroughDecodedFrame(frame) {
-                        try handler(decoded)
-                        return
-                    }
-                } else {
-                    try resampleDecodedFrame(frame, handler: handler)
+                if let decoded = convertFrame(frame) {
+                    try handler(decoded)
                     return
                 }
             }
+        }
+    }
+
+    /// Decode all frames in the file, calling handler for each decoded frame.
+    /// Returns normally on EOF. More efficient than repeated `decodeNextFrame` calls
+    /// as it unwraps optionals once and avoids per-frame throw/catch overhead.
+    public func decodeAllFrames(handler: (DecodedFrame) throws -> Void) throws {
+        guard let formatContext,
+              let codecContext,
+              let packet,
+              let frame else {
+            throw DecoderError.decodeFailed
+        }
+
+        while true {
+            let readResult = av_read_frame(formatContext, packet)
+            if readResult < 0 { return }
+
+            guard packet.pointee.stream_index == audioStreamIndex else {
+                av_packet_unref(packet)
+                continue
+            }
+
+            avcodec_send_packet(codecContext, packet)
+            av_packet_unref(packet)
+
+            while true {
+                let receiveResult = avcodec_receive_frame(codecContext, frame)
+                if receiveResult == -EAGAIN || receiveResult == AVERROR_EOF_VALUE { break }
+                if receiveResult < 0 {
+                    throw DecoderError.decodeFailed
+                }
+
+                if let decoded = convertFrame(frame) {
+                    do {
+                        try handler(decoded)
+                    } catch {
+                        av_frame_unref(frame)
+                        throw error
+                    }
+                }
+                av_frame_unref(frame)
+            }
+        }
+    }
+
+    // MARK: - Frame Conversion
+
+    /// Unified frame conversion dispatcher — routes to the optimal path based on source format.
+    private func convertFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> DecodedFrame? {
+        switch conversionMode {
+        case .passthrough:
+            return passthroughDecodedFrame(frame)
+        case .fastS32PToFloat, .fastS16PToFloat, .fastS32ToFloat, .fastS16ToFloat:
+            #if canImport(Accelerate)
+            return fastConvertIntFrame(frame)
+            #else
+            return nil
+            #endif
+        case .resample:
+            return resampleDecodedFrame(frame)
         }
     }
 
@@ -327,78 +422,151 @@ public final class Decoder: @unchecked Sendable {
         guard sampleCount > 0,
               let extendedData = frame.pointee.extended_data else { return nil }
 
-        var pointers: [UnsafePointer<Float>] = []
-        for ch in 0..<Int(outputChannels) {
+        let channelCount = Int(outputChannels)
+
+        // Resize cached array only when channel count changes (typically once)
+        if cachedChannelPointers.count != channelCount {
+            guard let firstPtr = extendedData[0] else { return nil }
+            let dummy = UnsafeRawPointer(firstPtr).assumingMemoryBound(to: Float.self)
+            cachedChannelPointers = Array(repeating: dummy, count: channelCount)
+        }
+
+        // Update pointers in-place — no heap allocation (COW, refcount is 1)
+        for ch in 0..<channelCount {
             guard let ptr = extendedData[ch] else { return nil }
-            pointers.append(UnsafeRawPointer(ptr).assumingMemoryBound(to: Float.self))
+            cachedChannelPointers[ch] = UnsafeRawPointer(ptr).assumingMemoryBound(to: Float.self)
         }
 
         return DecodedFrame(
-            channelData: pointers,
+            channelData: cachedChannelPointers,
             frameCount: Int(sampleCount),
             sampleRate: Double(outputSampleRate),
-            channelCount: Int(outputChannels)
+            channelCount: channelCount
         )
     }
 
-    private func resampleDecodedFrame(_ frame: UnsafeMutablePointer<AVFrame>, handler: (DecodedFrame) throws -> Void) throws {
-        guard let swrContext else { return }
+    #if canImport(Accelerate)
+    /// SIMD-accelerated integer → float conversion, bypassing swr entirely.
+    /// Handles both planar (stride 1, per-channel buffers) and interleaved
+    /// (stride N, single buffer) layouts via vDSP stride parameters.
+    private func fastConvertIntFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> DecodedFrame? {
+        let sampleCount = Int(frame.pointee.nb_samples)
+        guard sampleCount > 0,
+              let extendedData = frame.pointee.extended_data else { return nil }
+
+        let channelCount = Int(outputChannels)
+        ensureResampleBuffers(channelCount: channelCount, minCapacity: sampleCount)
+
+        let n = vDSP_Length(sampleCount)
+
+        switch conversionMode {
+        case .fastS32PToFloat:
+            var scale = Float(1.0 / 2147483648.0)
+            for ch in 0..<channelCount {
+                guard let srcRaw = extendedData[ch] else { return nil }
+                let src = UnsafeRawPointer(srcRaw).assumingMemoryBound(to: Int32.self)
+                vDSP_vflt32(src, 1, resampleBuffers[ch], 1, n)
+                vDSP_vsmul(resampleBuffers[ch], 1, &scale, resampleBuffers[ch], 1, n)
+            }
+        case .fastS32ToFloat:
+            var scale = Float(1.0 / 2147483648.0)
+            guard let srcRaw = extendedData[0] else { return nil }
+            let src = UnsafeRawPointer(srcRaw).assumingMemoryBound(to: Int32.self)
+            let inStride = vDSP_Stride(channelCount)
+            for ch in 0..<channelCount {
+                vDSP_vflt32(src.advanced(by: ch), inStride, resampleBuffers[ch], 1, n)
+                vDSP_vsmul(resampleBuffers[ch], 1, &scale, resampleBuffers[ch], 1, n)
+            }
+        case .fastS16PToFloat:
+            var scale = Float(1.0 / 32768.0)
+            for ch in 0..<channelCount {
+                guard let srcRaw = extendedData[ch] else { return nil }
+                let src = UnsafeRawPointer(srcRaw).assumingMemoryBound(to: Int16.self)
+                vDSP_vflt16(src, 1, resampleBuffers[ch], 1, n)
+                vDSP_vsmul(resampleBuffers[ch], 1, &scale, resampleBuffers[ch], 1, n)
+            }
+        case .fastS16ToFloat:
+            var scale = Float(1.0 / 32768.0)
+            guard let srcRaw = extendedData[0] else { return nil }
+            let src = UnsafeRawPointer(srcRaw).assumingMemoryBound(to: Int16.self)
+            let inStride = vDSP_Stride(channelCount)
+            for ch in 0..<channelCount {
+                vDSP_vflt16(src.advanced(by: ch), inStride, resampleBuffers[ch], 1, n)
+                vDSP_vsmul(resampleBuffers[ch], 1, &scale, resampleBuffers[ch], 1, n)
+            }
+        default:
+            return nil
+        }
+
+        return buildDecodedFrame(frameCount: sampleCount)
+    }
+    #endif
+
+    private func resampleDecodedFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> DecodedFrame? {
+        guard let swrContext else { return nil }
 
         let outSamples = swr_get_out_samples(swrContext, frame.pointee.nb_samples)
-        guard outSamples > 0 else { return }
+        guard outSamples > 0 else { return nil }
 
-        // Allocate temporary planar buffers for resampled output
         let channelCount = Int(outputChannels)
-        var buffers: [UnsafeMutablePointer<Float>] = []
-        for _ in 0..<channelCount {
-            buffers.append(.allocate(capacity: Int(outSamples)))
-        }
-        defer {
-            for buf in buffers { buf.deallocate() }
-        }
+        let srcChannelCount = Int(channels)
+        ensureResampleBuffers(channelCount: channelCount, minCapacity: Int(outSamples))
 
-        var outPointers: [UnsafeMutablePointer<UInt8>?] = buffers.map {
-            UnsafeMutableRawPointer($0).assumingMemoryBound(to: UInt8.self)
-        }
+        guard let extendedData = frame.pointee.extended_data else { return nil }
 
-        guard let extendedData = frame.pointee.extended_data else { return }
-
-        let convertedSamples = outPointers.withUnsafeMutableBufferPointer { outBufPtr -> Int32 in
-            var inPointers: [UnsafePointer<UInt8>?] = []
-            for i in 0..<Int(channels) {
-                if let ptr = extendedData[i] {
-                    inPointers.append(UnsafePointer(ptr))
-                }
+        // Stack-allocate pointer arrays to avoid per-frame heap allocation
+        let convertedSamples = withUnsafeTemporaryAllocation(
+            of: UnsafeMutablePointer<UInt8>?.self, capacity: channelCount
+        ) { outBuf in
+            for i in 0..<channelCount {
+                outBuf[i] = UnsafeMutableRawPointer(resampleBuffers[i])
+                    .assumingMemoryBound(to: UInt8.self)
             }
-            while inPointers.count < channelCount {
-                if let first = inPointers.first {
-                    inPointers.append(first)
-                } else {
-                    break
+            return withUnsafeTemporaryAllocation(
+                of: UnsafePointer<UInt8>?.self, capacity: max(channelCount, srcChannelCount)
+            ) { inBuf in
+                var count = 0
+                for i in 0..<srcChannelCount {
+                    if let ptr = extendedData[i] {
+                        inBuf[count] = UnsafePointer(ptr)
+                        count += 1
+                    }
                 }
-            }
-
-            return inPointers.withUnsafeBufferPointer { inBufPtr in
-                swr_convert(
+                while count < channelCount {
+                    inBuf[count] = inBuf[0]
+                    count += 1
+                }
+                return swr_convert(
                     swrContext,
-                    outBufPtr.baseAddress,
+                    outBuf.baseAddress!,
                     outSamples,
-                    inBufPtr.baseAddress,
+                    inBuf.baseAddress!,
                     frame.pointee.nb_samples
                 )
             }
         }
 
-        guard convertedSamples > 0 else { return }
+        guard convertedSamples > 0 else { return nil }
 
-        let pointers: [UnsafePointer<Float>] = buffers.map { UnsafePointer($0) }
-        let decoded = DecodedFrame(
-            channelData: pointers,
-            frameCount: Int(convertedSamples),
+        return buildDecodedFrame(frameCount: Int(convertedSamples))
+    }
+
+    /// Build a DecodedFrame from resampleBuffers, updating cachedChannelPointers in-place.
+    private func buildDecodedFrame(frameCount: Int) -> DecodedFrame {
+        let channelCount = Int(outputChannels)
+        if cachedChannelPointers.count != channelCount {
+            cachedChannelPointers = resampleBuffers.map { UnsafePointer($0) }
+        } else {
+            for i in 0..<channelCount {
+                cachedChannelPointers[i] = UnsafePointer(resampleBuffers[i])
+            }
+        }
+        return DecodedFrame(
+            channelData: cachedChannelPointers,
+            frameCount: frameCount,
             sampleRate: Double(outputSampleRate),
             channelCount: channelCount
         )
-        try handler(decoded)
     }
 
     public func seek(to time: TimeInterval) {
@@ -422,6 +590,12 @@ public final class Decoder: @unchecked Sendable {
     }
 
     public func close() {
+        // Free pre-allocated resample buffers
+        for buf in resampleBuffers { buf.deallocate() }
+        resampleBuffers = []
+        resampleBufferCapacity = 0
+        cachedChannelPointers = []
+
         if swrContext != nil {
             swr_free(&self.swrContext)
         }
@@ -444,7 +618,7 @@ public final class Decoder: @unchecked Sendable {
         bitrate = 0
         codecName = ""
         bitsPerSample = 0
-        isPassthrough = false
+        conversionMode = .resample
     }
 
     // MARK: - Format Conversion Helpers
