@@ -43,12 +43,18 @@ public final class TagWriter: @unchecked Sendable {
             throw TagWriterError.streamInfoFailed
         }
 
-        // Create output format context
+        // Create output format context — try extension-based detection first,
+        // fall back to input format name for containers where the extension
+        // doesn't map to the correct muxer (e.g., .opus → ogg)
         var outCtxPtr: UnsafeMutablePointer<AVFormatContext>?
-        guard avformat_alloc_output_context2(&outCtxPtr, nil, nil, outputURL.path) >= 0,
-              let outCtx = outCtxPtr else {
-            throw TagWriterError.outputFormatFailed
+        if avformat_alloc_output_context2(&outCtxPtr, nil, nil, outputURL.path) < 0 || outCtxPtr == nil {
+            let inputFormatName = String(cString: inCtx.pointee.iformat.pointee.name)
+            guard avformat_alloc_output_context2(&outCtxPtr, nil, inputFormatName, outputURL.path) >= 0,
+                  outCtxPtr != nil else {
+                throw TagWriterError.outputFormatFailed
+            }
         }
+        let outCtx = outCtxPtr!
         defer {
             if outCtx.pointee.pb != nil {
                 avio_closep(&outCtx.pointee.pb)
