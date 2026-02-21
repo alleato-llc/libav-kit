@@ -71,4 +71,4 @@ Lossy: MP3 (CBR/VBR/ABR), AAC (LC/HE-AAC/HE-AACv2), Opus, Vorbis
 
 ## Test Architecture
 
-83 Gherkin scenarios across 4 feature files (encoding, decoding, cover_art, metadata). Step definitions are split into SetupSteps (Given), ActionSteps (When), and VerificationSteps (Then). EncodingSettingsResolver maps feature table keys to EncodingSettings values.
+108 Gherkin scenarios across 5 feature files (encoding, decoding, cover_art, metadata, playback). Step definitions are split into SetupSteps (Given), ActionSteps (When), and VerificationSteps (Then). EncodingSettingsResolver maps feature table keys to EncodingSettings values.

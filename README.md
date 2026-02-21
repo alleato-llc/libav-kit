@@ -239,14 +239,15 @@ swift test --skip BDDTests
 
 ### BDD Contract Tests
 
-83 Gherkin scenarios validate the public API across 4 feature files in `Features/` (at the project root, symlinked into the test target for SPM resource bundling):
+108 Gherkin scenarios validate the public API across 5 feature files in `Features/` (at the project root, symlinked into the test target for SPM resource bundling):
 
 | Feature | Scenarios | What it tests |
 |---------|-----------|---------------|
-| `encoding.feature` | 30 | All 9 target formats, hi-res, downsampling |
-| `decoding.feature` | 30 | All 9 source codecs, sample rates, channels |
+| `encoding.feature` | 25 | All 9 target formats, hi-res, downsampling |
+| `decoding.feature` | 36 | All 9 source codecs, sample rates, channels |
 | `cover_art.feature` | 12 | Embed and remove across 6 supported codecs |
-| `metadata.feature` | 11 | Tag write/read round-trip for all codecs |
+| `metadata.feature` | 10 | Tag write/read round-trip for all codecs |
+| `playback.feature` | 25 | Play, pause, seek, volume across all codecs |
 
 Uses [PickleKit](https://github.com/alleato-llc/pickle-kit) with the Swift Testing bridge (`GherkinTestScenario`).
 
