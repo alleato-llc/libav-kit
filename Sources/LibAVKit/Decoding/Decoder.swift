@@ -15,6 +15,7 @@ public enum DecoderError: Error, LocalizedError {
     case resamplerfailed
     case endOfFile
     case notConfigured
+    case readTimedOut
 
     public var errorDescription: String? {
         switch self {
@@ -36,6 +37,8 @@ public enum DecoderError: Error, LocalizedError {
             "End of file reached"
         case .notConfigured:
             "Decoder not configured"
+        case .readTimedOut:
+            "Audio read timed out"
         }
     }
 }
@@ -43,6 +46,38 @@ public enum DecoderError: Error, LocalizedError {
 // FFmpeg constants that can't be imported as macros
 private let AV_NOPTS_VALUE: Int64 = .init(bitPattern: 0x8000_0000_0000_0000)
 private let AVERROR_EOF_VALUE: Int32 = -541_478_725
+
+/// Monotonic clock in seconds, safe to call from the C interrupt callback.
+private func libavMonotonicNow() -> Double {
+    var spec = timespec()
+    clock_gettime(CLOCK_MONOTONIC, &spec)
+    return Double(spec.tv_sec) + Double(spec.tv_nsec) / 1_000_000_000
+}
+
+/// Deadline box shared with the C interrupt callback. FFmpeg invokes the callback
+/// synchronously, on the same thread that issued the blocking call, so a plain
+/// `var` is safe (no cross-thread access).
+private final class IOInterruptState {
+    /// Monotonic-clock deadline in seconds; `0` means disarmed (no timeout active).
+    var deadline: Double = 0
+    /// Set by the callback when it aborts a call, so the caller can distinguish a
+    /// timeout from an ordinary read error.
+    var didInterrupt: Bool = false
+}
+
+/// FFmpeg interrupt callback: returns non-zero to abort the in-progress blocking
+/// I/O operation once the armed deadline passes. Captures nothing — all state is
+/// read through the `opaque` pointer, so it converts to a C function pointer.
+private let decoderInterruptCallback: @convention(c) (UnsafeMutableRawPointer?) -> Int32 = { opaque in
+    guard let opaque else { return 0 }
+    let state = Unmanaged<IOInterruptState>.fromOpaque(opaque).takeUnretainedValue()
+    let deadline = state.deadline
+    if deadline > 0, libavMonotonicNow() >= deadline {
+        state.didInterrupt = true
+        return 1
+    }
+    return 0
+}
 
 public final class Decoder: @unchecked Sendable {
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
@@ -81,6 +116,19 @@ public final class Decoder: @unchecked Sendable {
     public private(set) var bitrate: Int = 0
     public private(set) var codecName: String = ""
     public private(set) var bitsPerSample: Int = 0
+
+    /// Maximum time a single blocking I/O operation (open, stream-info probe, packet
+    /// read) may take before it is aborted. `0` disables the timeout (default), which
+    /// preserves the original blocking behavior for local files and encoders.
+    ///
+    /// Set a positive value for network sources (NAS/SMB): a hung read then fails fast
+    /// with ``DecoderError/readTimedOut`` instead of blocking the decode loop forever,
+    /// and the format context stays valid so the caller can rebuffer and retry.
+    public var ioTimeout: TimeInterval = 0
+
+    /// Deadline box read by the C interrupt callback. Lifetime ⊇ the format context,
+    /// so `passUnretained` into the callback's `opaque` pointer is safe.
+    private let interruptState = IOInterruptState()
 
     /// The source audio format detected from the file
     public var sourceFormat: AudioOutputFormat? {
@@ -152,11 +200,35 @@ public final class Decoder: @unchecked Sendable {
         try setupResampler()
     }
 
+    /// Allocate a format context with our interrupt callback installed, so the
+    /// `ioTimeout` deadline can abort blocking calls during open and reads.
+    private func makeInterruptibleContext() -> UnsafeMutablePointer<AVFormatContext>? {
+        guard let ctx = avformat_alloc_context() else { return nil }
+        ctx.pointee.interrupt_callback.callback = decoderInterruptCallback
+        ctx.pointee.interrupt_callback.opaque = Unmanaged.passUnretained(interruptState).toOpaque()
+        return ctx
+    }
+
+    /// Arm the I/O deadline for an upcoming blocking call. No-op when `ioTimeout == 0`.
+    private func armIOTimeout() {
+        guard ioTimeout > 0 else { return }
+        interruptState.didInterrupt = false
+        interruptState.deadline = libavMonotonicNow() + ioTimeout
+    }
+
+    /// Disarm the deadline so subsequent CPU-bound work (decode, convert) isn't timed.
+    private func disarmIOTimeout() {
+        interruptState.deadline = 0
+    }
+
     public func open(url: URL) throws {
         close()
 
         let path = url.path
-        var fmtCtx: UnsafeMutablePointer<AVFormatContext>?
+        var fmtCtx = makeInterruptibleContext()
+
+        armIOTimeout()
+        defer { disarmIOTimeout() }
 
         guard avformat_open_input(&fmtCtx, path, nil, nil) == 0 else {
             throw DecoderError.openFailed(path)
@@ -171,8 +243,11 @@ public final class Decoder: @unchecked Sendable {
     public func open(path: String, inputFormat: String? = nil) throws {
         close()
 
-        var fmtCtx: UnsafeMutablePointer<AVFormatContext>?
+        var fmtCtx = makeInterruptibleContext()
         let fmt: UnsafePointer<AVInputFormat>? = inputFormat.flatMap { av_find_input_format($0) }
+
+        armIOTimeout()
+        defer { disarmIOTimeout() }
 
         guard avformat_open_input(&fmtCtx, path, fmt, nil) == 0 else {
             throw DecoderError.openFailed(path)
@@ -335,12 +410,27 @@ public final class Decoder: @unchecked Sendable {
 
         while true {
             if !isDraining {
-                let readResult = av_read_frame(formatContext, packet)
+                let readResult: Int32
+                if ioTimeout > 0 {
+                    armIOTimeout()
+                    readResult = av_read_frame(formatContext, packet)
+                    disarmIOTimeout()
+                } else {
+                    readResult = av_read_frame(formatContext, packet)
+                }
+
                 if readResult == AVERROR_EOF_VALUE || readResult == -EAGAIN {
                     // Demuxer exhausted — switch the codec to drain mode and fall
                     // through to receive the frames it still holds
                     isDraining = true
                     avcodec_send_packet(codecContext, nil)
+                } else if readResult < 0 {
+                    // Either the ioTimeout aborted a hung read, or the demuxer hit a
+                    // transient read error (e.g. a network mount dropped). Surface a
+                    // recoverable error — the format context stays valid, so the caller
+                    // can rebuffer and call decodeNextFrame again to retry.
+                    av_packet_unref(packet)
+                    throw interruptState.didInterrupt ? DecoderError.readTimedOut : DecoderError.decodeFailed
                 } else {
                     defer { av_packet_unref(packet) }
 
