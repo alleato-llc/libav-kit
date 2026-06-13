@@ -106,6 +106,11 @@ public final class Decoder: @unchecked Sendable {
     private var packet: UnsafeMutablePointer<AVPacket>?
     private var frame: UnsafeMutablePointer<AVFrame>?
 
+    /// True once the demuxer has hit EOF and the codec has been switched to
+    /// drain mode (null packet sent). Remaining buffered frames are then pulled
+    /// from the codec until it reports EOF. Reset by `seek(to:)` and `close()`.
+    private var isDraining = false
+
     public init() {
         packet = av_packet_alloc()
         frame = av_frame_alloc()
@@ -313,6 +318,12 @@ public final class Decoder: @unchecked Sendable {
 
     /// Decode the next frame and pass raw audio data to the handler via ``DecodedFrame``.
     /// The frame's pointers are only valid for the duration of the callback.
+    ///
+    /// When the demuxer reaches EOF, the codec is switched to drain mode so frames
+    /// it still buffers internally (codec delay — MP3, AAC, etc.) are delivered
+    /// before ``DecoderError/endOfFile`` is thrown. Without draining, the tail of
+    /// every file would be silently dropped.
+    ///
     /// Throws ``DecoderError/endOfFile`` when no more data is available.
     public func decodeNextFrame(handler: (DecodedFrame) throws -> Void) throws {
         guard let formatContext,
@@ -323,23 +334,31 @@ public final class Decoder: @unchecked Sendable {
         }
 
         while true {
-            let readResult = av_read_frame(formatContext, packet)
-            if readResult == AVERROR_EOF_VALUE || readResult == -EAGAIN {
-                throw DecoderError.endOfFile
+            if !isDraining {
+                let readResult = av_read_frame(formatContext, packet)
+                if readResult == AVERROR_EOF_VALUE || readResult == -EAGAIN {
+                    // Demuxer exhausted — switch the codec to drain mode and fall
+                    // through to receive the frames it still holds
+                    isDraining = true
+                    avcodec_send_packet(codecContext, nil)
+                } else {
+                    defer { av_packet_unref(packet) }
+
+                    guard packet.pointee.stream_index == audioStreamIndex else {
+                        continue
+                    }
+
+                    let sendResult = avcodec_send_packet(codecContext, packet)
+                    if sendResult < 0 { continue }
+                }
             }
-
-            defer { av_packet_unref(packet) }
-
-            guard packet.pointee.stream_index == audioStreamIndex else {
-                continue
-            }
-
-            let sendResult = avcodec_send_packet(codecContext, packet)
-            if sendResult < 0 { continue }
 
             while true {
                 let receiveResult = avcodec_receive_frame(codecContext, frame)
-                if receiveResult == -EAGAIN || receiveResult == AVERROR_EOF_VALUE {
+                if receiveResult == AVERROR_EOF_VALUE {
+                    throw DecoderError.endOfFile
+                }
+                if receiveResult == -EAGAIN {
                     break
                 }
                 if receiveResult < 0 {
@@ -352,6 +371,11 @@ public final class Decoder: @unchecked Sendable {
                     try handler(decoded)
                     return
                 }
+            }
+
+            // EAGAIN while draining shouldn't occur; treat as EOF to avoid spinning
+            if isDraining {
+                throw DecoderError.endOfFile
             }
         }
     }
@@ -367,21 +391,29 @@ public final class Decoder: @unchecked Sendable {
             throw DecoderError.decodeFailed
         }
 
+        var draining = false
         while true {
-            let readResult = av_read_frame(formatContext, packet)
-            if readResult < 0 { return }
+            if !draining {
+                let readResult = av_read_frame(formatContext, packet)
+                if readResult < 0 {
+                    // Demuxer exhausted — drain frames still buffered in the codec
+                    draining = true
+                    avcodec_send_packet(codecContext, nil)
+                } else {
+                    guard packet.pointee.stream_index == audioStreamIndex else {
+                        av_packet_unref(packet)
+                        continue
+                    }
 
-            guard packet.pointee.stream_index == audioStreamIndex else {
-                av_packet_unref(packet)
-                continue
+                    avcodec_send_packet(codecContext, packet)
+                    av_packet_unref(packet)
+                }
             }
-
-            avcodec_send_packet(codecContext, packet)
-            av_packet_unref(packet)
 
             while true {
                 let receiveResult = avcodec_receive_frame(codecContext, frame)
-                if receiveResult == -EAGAIN || receiveResult == AVERROR_EOF_VALUE { break }
+                if receiveResult == AVERROR_EOF_VALUE { return }
+                if receiveResult == -EAGAIN { break }
                 if receiveResult < 0 {
                     throw DecoderError.decodeFailed
                 }
@@ -396,6 +428,9 @@ public final class Decoder: @unchecked Sendable {
                 }
                 av_frame_unref(frame)
             }
+
+            // EAGAIN while draining shouldn't occur; stop to avoid spinning
+            if draining { return }
         }
     }
 
@@ -582,10 +617,18 @@ public final class Decoder: @unchecked Sendable {
             avcodec_flush_buffers(codecContext)
         }
 
-        // Flush the resampler to clear any buffered samples from before the seek
+        // Seeking exits drain mode — avcodec_flush_buffers resets the codec so it
+        // accepts packets again
+        isDraining = false
+
+        // Discard samples buffered in the resampler from before the seek.
+        // (swr_convert with a nil output buffer flushes nothing — drop the
+        // delayed samples explicitly.)
         if let swrContext {
-            // Passing nil input flushes the resampler
-            swr_convert(swrContext, nil, 0, nil, 0)
+            let delay = swr_get_delay(swrContext, Int64(outputSampleRate))
+            if delay > 0 {
+                swr_drop_output(swrContext, Int32(clamping: delay))
+            }
         }
     }
 
@@ -619,6 +662,7 @@ public final class Decoder: @unchecked Sendable {
         codecName = ""
         bitsPerSample = 0
         conversionMode = .resample
+        isDraining = false
     }
 
     // MARK: - Format Conversion Helpers
